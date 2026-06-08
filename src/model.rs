@@ -11,13 +11,52 @@
 //! `--cell`, default 5); TREND and ALLELIC are always computed.
 
 use crate::stats::chi2_sf;
-use rsomics_pgen::Pgen;
+use rsomics_pgen::{Pgen, PgenMmap, Sample, Variant};
 use std::io::Write;
 
 pub const DEFAULT_CELL: u32 = 5;
 
+/// Variant-major genotype access shared by the in-memory and mmap readers, so
+/// `--model` runs identically whichever one main feeds it.
+pub trait BedRows {
+    fn samples(&self) -> &[Sample];
+    fn variants(&self) -> &[Variant];
+    fn n_variants(&self) -> usize;
+    fn variant_row(&self, v: usize) -> &[u8];
+}
+
+impl BedRows for Pgen {
+    fn samples(&self) -> &[Sample] {
+        &self.samples
+    }
+    fn variants(&self) -> &[Variant] {
+        &self.variants
+    }
+    fn n_variants(&self) -> usize {
+        self.n_variants()
+    }
+    fn variant_row(&self, v: usize) -> &[u8] {
+        self.variant_row(v)
+    }
+}
+
+impl BedRows for PgenMmap {
+    fn samples(&self) -> &[Sample] {
+        &self.samples
+    }
+    fn variants(&self) -> &[Variant] {
+        &self.variants
+    }
+    fn n_variants(&self) -> usize {
+        self.n_variants()
+    }
+    fn variant_row(&self, v: usize) -> &[u8] {
+        self.variant_row(v)
+    }
+}
+
 /// Counts of HomA1 / Het / HomA2 for one phenotype group.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 struct GenoCounts {
     hom_a1: u32,
     het: u32,
@@ -28,7 +67,7 @@ struct GenoCounts {
 const TESTS: [&str; 5] = ["GENO", "TREND", "ALLELIC", "DOM", "REC"];
 
 /// All per-variant results, borrowing the variant identifiers from the source
-/// `Pgen`. The genotype counts are kept oriented (A1 = minor) so the count
+/// reader. The genotype counts are kept oriented (A1 = minor) so the count
 /// columns can be formatted at print time; `a1`/`a2` are owned only when the
 /// minor-allele swap relabels them. Only the five (chisq, df, p) statistics are
 /// precomputed in the parallel build (`None` = NA), keeping it allocation-free.
@@ -60,7 +99,6 @@ const LO_LANES: u64 = 0x5555_5555_5555_5555;
 struct GroupMasks {
     case: Vec<u64>,
     ctrl: Vec<u64>,
-    n_samples: usize,
 }
 
 impl GroupMasks {
@@ -76,73 +114,74 @@ impl GroupMasks {
                 Pheno::Skip => {}
             }
         }
-        Self {
-            case,
-            ctrl,
-            n_samples: pheno.len(),
-        }
+        Self { case, ctrl }
     }
 }
 
+/// Six masked class×group bit-streams per word, in `[case, ctrl] × [HomA1, Het,
+/// HomA2]` order. Each carries one set bit per matching sample at that sample's
+/// lane-low-bit position.
+#[inline]
+fn class_streams(word: u64, cm: u64, um: u64) -> [u64; 6] {
+    let lo = word & LO_LANES;
+    let hi = (word >> 1) & LO_LANES;
+    let hom_a1 = !hi & !lo & LO_LANES;
+    let het = hi & !lo;
+    let hom_a2 = hi & lo;
+    [
+        hom_a1 & cm,
+        het & cm,
+        hom_a2 & cm,
+        hom_a1 & um,
+        het & um,
+        hom_a2 & um,
+    ]
+}
+
 /// Count, per phenotype group, the HomA1/Het/HomA2 genotypes in one variant
-/// row using per-word bit-plane masks and popcounts (missing lanes ignored).
+/// row, one 32-sample word at a time. The six class×group bit-streams reduce to
+/// a `popcnt` each; missing lanes never enter a stream, so they are ignored.
 fn count_row(row: &[u8], masks: &GroupMasks) -> (GenoCounts, GenoCounts) {
-    let mut a = [0u32; 3];
-    let mut u = [0u32; 3];
-    let words = masks.n_samples.div_ceil(32);
+    let mut t = [0u32; 6];
+    let mut w = 0;
     let chunks = row.chunks_exact(8);
     let tail = chunks.remainder();
-    for (w, chunk) in chunks.enumerate() {
-        let word = u64::from_le_bytes(chunk.try_into().unwrap());
-        accumulate(word, masks.case[w], masks.ctrl[w], &mut a, &mut u);
+    for chunk in chunks {
+        let s = class_streams(
+            u64::from_le_bytes(chunk.try_into().unwrap()),
+            masks.case[w],
+            masks.ctrl[w],
+        );
+        for k in 0..6 {
+            t[k] += s[k].count_ones();
+        }
+        w += 1;
     }
     if !tail.is_empty() {
         let mut buf = [0u8; 8];
         buf[..tail.len()].copy_from_slice(tail);
-        let w = words - 1;
-        accumulate(
-            u64::from_le_bytes(buf),
-            masks.case[w],
-            masks.ctrl[w],
-            &mut a,
-            &mut u,
-        );
+        let s = class_streams(u64::from_le_bytes(buf), masks.case[w], masks.ctrl[w]);
+        for k in 0..6 {
+            t[k] += s[k].count_ones();
+        }
     }
     (
         GenoCounts {
-            hom_a1: a[0],
-            het: a[1],
-            hom_a2: a[2],
+            hom_a1: t[0],
+            het: t[1],
+            hom_a2: t[2],
         },
         GenoCounts {
-            hom_a1: u[0],
-            het: u[1],
-            hom_a2: u[2],
+            hom_a1: t[3],
+            het: t[4],
+            hom_a2: t[5],
         },
     )
 }
 
-#[inline]
-fn accumulate(word: u64, cm: u64, um: u64, a: &mut [u32; 3], u: &mut [u32; 3]) {
-    let lo = word & LO_LANES;
-    let hi = (word >> 1) & LO_LANES;
-    // Class indicators, one set bit per matching lane (low-bit position).
-    let hom_a1 = !hi & !lo & LO_LANES;
-    let het = hi & !lo;
-    let hom_a2 = hi & lo;
-    a[0] += (hom_a1 & cm).count_ones();
-    a[1] += (het & cm).count_ones();
-    a[2] += (hom_a2 & cm).count_ones();
-    u[0] += (hom_a1 & um).count_ones();
-    u[1] += (het & um).count_ones();
-    u[2] += (hom_a2 & um).count_ones();
-}
-
-pub fn model_test(pgen: &Pgen, cell: u32) -> Vec<VariantTests<'_>> {
-    use rayon::prelude::*;
-
+fn pheno_masks(pgen: &impl BedRows) -> GroupMasks {
     let pheno: Vec<Pheno> = pgen
-        .samples
+        .samples()
         .iter()
         .map(|s| match s.phen.as_str() {
             "2" => Pheno::Aff,
@@ -150,15 +189,77 @@ pub fn model_test(pgen: &Pgen, cell: u32) -> Vec<VariantTests<'_>> {
             _ => Pheno::Skip,
         })
         .collect();
-    let masks = GroupMasks::build(&pheno);
+    GroupMasks::build(&pheno)
+}
 
+pub fn model_test<R: BedRows + Sync>(pgen: &R, cell: u32) -> Vec<VariantTests<'_>> {
+    use rayon::prelude::*;
+    let masks = pheno_masks(pgen);
     (0..pgen.n_variants())
         .into_par_iter()
         .map(|v| {
             let (aff, unaff) = count_row(pgen.variant_row(v), &masks);
-            build_tests(&pgen.variants[v], aff, unaff, cell)
+            build_tests(&pgen.variants()[v], aff, unaff, cell)
         })
         .collect()
+}
+
+/// Compute and emit the full `.model` report in one fused streaming pass: each
+/// block of variants is counted, tested, and rendered to text in parallel, then
+/// written, so the 150 k×5-row table never materialises as an intermediate
+/// `Vec<VariantTests>` nor gets a second cold-memory formatting pass.
+pub fn write_model<R: BedRows + Sync>(
+    pgen: &R,
+    cell: u32,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    use rayon::prelude::*;
+    let masks = pheno_masks(pgen);
+    let snp_w = pgen
+        .variants()
+        .iter()
+        .map(|v| v.id.len())
+        .max()
+        .map_or(4, |m| if m <= 4 { 4 } else { m + 2 });
+
+    out.write_all(&header_line(snp_w))?;
+
+    let line_slot = snp_w + 96;
+    let block_slot = line_slot * 5;
+    const BLOCK_VARIANTS: usize = 8192;
+    let n = pgen.n_variants();
+    let mut buf = vec![0u8; block_slot * n.min(BLOCK_VARIANTS)];
+
+    for start in (0..n).step_by(BLOCK_VARIANTS) {
+        let width = (start + BLOCK_VARIANTS).min(n) - start;
+        let ends: Vec<usize> = buf
+            .par_chunks_mut(block_slot)
+            .take(width)
+            .enumerate()
+            .map(|(i, slot)| {
+                let v = start + i;
+                let (aff, unaff) = count_row(pgen.variant_row(v), &masks);
+                let t = build_tests(&pgen.variants()[v], aff, unaff, cell);
+                format_variant(slot, &t, snp_w)
+            })
+            .collect();
+        let total: usize = ends.iter().sum();
+        pack_blocks(&mut buf, block_slot, &ends, total);
+        out.write_all(&buf[..total])?;
+    }
+    Ok(())
+}
+
+fn header_line(snp_w: usize) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut header = Vec::with_capacity(96);
+    writeln!(
+        header,
+        " CHR {:>snp_w$} {:>4} {:>4} {:>8} {:>14} {:>14} {:>12} {:>4} {:>12}",
+        "SNP", "A1", "A2", "TEST", "AFF", "UNAFF", "CHISQ", "DF", "P"
+    )
+    .unwrap();
+    header
 }
 
 impl GenoCounts {
@@ -306,49 +407,71 @@ fn cochran_armitage(aff: GenoCounts, unaff: GenoCounts) -> f64 {
 /// is right-justified to a width that fits the longest variant ID (the same
 /// rule PLINK uses): 4 for IDs up to 4 chars, otherwise the longest ID + 2.
 ///
-/// Each variant's five-line block is formatted in parallel; the blocks are
-/// concatenated in order so the streamed bytes match PLINK exactly.
+/// Each variant's five-line block is formatted in parallel into its own
+/// fixed-width slot; a gather pass packs the live bytes down to one contiguous
+/// image that is emitted in a single write so the streamed bytes match PLINK
+/// exactly while keeping the write path off the per-variant serial loop.
 pub fn print_model(records: &[VariantTests], out: &mut impl Write) -> std::io::Result<()> {
-    use std::io::Write as _;
+    use rayon::prelude::*;
     let snp_w = snp_field_width(records);
+    out.write_all(&header_line(snp_w))?;
 
-    let mut header = Vec::with_capacity(96);
-    writeln!(
-        header,
-        " CHR {:>snp_w$} {:>4} {:>4} {:>8} {:>14} {:>14} {:>12} {:>4} {:>12}",
-        "SNP", "A1", "A2", "TEST", "AFF", "UNAFF", "CHISQ", "DF", "P"
-    )
-    .unwrap();
-    out.write_all(&header)?;
+    // The five fixed-width fields plus separators and newline never exceed this
+    // for one line; the slack covers alleles or counts that overflow their pad.
+    let line_slot = snp_w + 96;
+    let block_slot = line_slot * 5;
 
-    let mut buf: Vec<u8> = Vec::with_capacity(8 << 20);
-    let mut counts: Vec<u8> = Vec::with_capacity(16);
-    for r in records {
-        format_variant(&mut buf, &mut counts, r, snp_w);
-        if buf.len() >= 4 << 20 {
-            out.write_all(&buf)?;
-            buf.clear();
-        }
+    // Variants are blocked so a wide matrix never buffers the whole image at
+    // once; each block's slots are filled in parallel, packed, then written.
+    const BLOCK_VARIANTS: usize = 8192;
+    let mut buf = vec![0u8; block_slot * records.len().min(BLOCK_VARIANTS)];
+
+    for chunk in records.chunks(BLOCK_VARIANTS) {
+        let ends: Vec<usize> = buf
+            .par_chunks_mut(block_slot)
+            .zip(chunk.par_iter())
+            .map(|(slot, r)| format_variant(slot, r, snp_w))
+            .collect();
+        let total: usize = ends.iter().sum();
+        pack_blocks(&mut buf, block_slot, &ends, total);
+        out.write_all(&buf[..total])?;
     }
-    out.write_all(&buf)?;
     Ok(())
 }
 
-fn format_variant(block: &mut Vec<u8>, counts: &mut Vec<u8>, r: &VariantTests, snp_w: usize) {
+/// Compact the per-variant slots (each `block_slot` wide, the i-th holding
+/// `ends[i]` live bytes) down into the contiguous prefix `buf[..total]`.
+fn pack_blocks(buf: &mut [u8], block_slot: usize, ends: &[usize], total: usize) {
+    let mut write = 0usize;
+    let mut read = 0usize;
+    for &end in ends {
+        if write != read {
+            buf.copy_within(read..read + end, write);
+        }
+        write += end;
+        read += block_slot;
+    }
+    debug_assert_eq!(write, total);
+}
+
+/// Format one variant's five-line block into the start of `slot`, returning the
+/// number of bytes written.
+fn format_variant(slot: &mut [u8], r: &VariantTests, snp_w: usize) -> usize {
     let (a, u) = (r.aff, r.unaff);
     let aa = [a.hom_a1 * 2 + a.het, a.het + a.hom_a2 * 2];
     let ua = [u.hom_a1 * 2 + u.het, u.het + u.hom_a2 * 2];
+    let mut w = Slot { buf: slot, pos: 0 };
     for (i, &test) in TESTS.iter().enumerate() {
-        push_padded(block, r.chrom.as_bytes(), 4);
-        block.push(b' ');
-        push_padded(block, r.snp.as_bytes(), snp_w);
-        block.push(b' ');
-        push_padded(block, r.a1.as_bytes(), 4);
-        block.push(b' ');
-        push_padded(block, r.a2.as_bytes(), 4);
-        block.push(b' ');
-        push_padded(block, test.as_bytes(), 8);
-        block.push(b' ');
+        w.padded(r.chrom.as_bytes(), 4);
+        w.space();
+        w.padded(r.snp.as_bytes(), snp_w);
+        w.space();
+        w.padded(r.a1.as_bytes(), 4);
+        w.space();
+        w.padded(r.a2.as_bytes(), 4);
+        w.space();
+        w.padded(test.as_bytes(), 8);
+        w.space();
 
         let (aff_n, unaff_n): (&[u32], &[u32]) = match i {
             0 => (&[a.hom_a1, a.het, a.hom_a2], &[u.hom_a1, u.het, u.hom_a2]),
@@ -356,55 +479,100 @@ fn format_variant(block: &mut Vec<u8>, counts: &mut Vec<u8>, r: &VariantTests, s
             3 => (&[a.hom_a1 + a.het, a.hom_a2], &[u.hom_a1 + u.het, u.hom_a2]),
             _ => (&[a.hom_a1, a.het + a.hom_a2], &[u.hom_a1, u.het + u.hom_a2]),
         };
-        counts.clear();
-        push_slashed(counts, aff_n);
-        push_padded(block, counts, 14);
-        block.push(b' ');
-        counts.clear();
-        push_slashed(counts, unaff_n);
-        push_padded(block, counts, 14);
-        block.push(b' ');
+        w.padded_slashed(aff_n, 14);
+        w.space();
+        w.padded_slashed(unaff_n, 14);
+        w.space();
 
         match r.stats[i] {
             Some((chisq, df, p)) => {
-                counts.clear();
-                fmt_sig_into(counts, chisq, 4);
-                push_padded(block, counts, 12);
-                block.push(b' ');
-                counts.clear();
-                push_uint(counts, u64::from(df));
-                push_padded(block, counts, 4);
-                block.push(b' ');
-                counts.clear();
-                fmt_sig_into(counts, p, 4);
-                push_padded(block, counts, 12);
+                w.padded_sig(chisq, 12);
+                w.space();
+                w.padded_uint(u64::from(df), 4);
+                w.space();
+                w.padded_sig(p, 12);
             }
             None => {
-                push_padded(block, b"NA", 12);
-                block.push(b' ');
-                push_padded(block, b"NA", 4);
-                block.push(b' ');
-                push_padded(block, b"NA", 12);
+                w.padded(b"NA", 12);
+                w.space();
+                w.padded(b"NA", 4);
+                w.space();
+                w.padded(b"NA", 12);
             }
         }
-        block.push(b'\n');
+        w.newline();
     }
+    w.pos
 }
 
-/// Right-justify `s` into a `width`-wide field, padding with spaces.
-fn push_padded(out: &mut Vec<u8>, s: &[u8], width: usize) {
-    for _ in 0..width.saturating_sub(s.len()) {
-        out.push(b' ');
-    }
-    out.extend_from_slice(s);
+/// A cursor writing right-justified, space-separated fields straight into a
+/// variant's pre-sized output slot, no intermediate per-field heap buffers.
+struct Slot<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
 }
 
-fn push_slashed(out: &mut Vec<u8>, ns: &[u32]) {
-    for (i, &n) in ns.iter().enumerate() {
-        if i > 0 {
-            out.push(b'/');
+impl Slot<'_> {
+    #[inline]
+    fn space(&mut self) {
+        self.buf[self.pos] = b' ';
+        self.pos += 1;
+    }
+
+    #[inline]
+    fn newline(&mut self) {
+        self.buf[self.pos] = b'\n';
+        self.pos += 1;
+    }
+
+    #[inline]
+    fn pad(&mut self, content_len: usize, width: usize) {
+        for _ in 0..width.saturating_sub(content_len) {
+            self.buf[self.pos] = b' ';
+            self.pos += 1;
         }
-        push_uint(out, u64::from(n));
+    }
+
+    #[inline]
+    fn raw(&mut self, s: &[u8]) {
+        self.buf[self.pos..self.pos + s.len()].copy_from_slice(s);
+        self.pos += s.len();
+    }
+
+    #[inline]
+    fn padded(&mut self, s: &[u8], width: usize) {
+        self.pad(s.len(), width);
+        self.raw(s);
+    }
+
+    fn padded_uint(&mut self, n: u64, width: usize) {
+        let mut tmp = [0u8; 20];
+        let s = fmt_uint(&mut tmp, n);
+        self.padded(s, width);
+    }
+
+    fn padded_slashed(&mut self, ns: &[u32], width: usize) {
+        // Slash-joined counts never exceed a 2×3-table cell's worst case;
+        // 32 bytes covers three 10-digit numbers plus two separators.
+        let mut tmp = [0u8; 32];
+        let mut len = 0;
+        let mut digits = [0u8; 20];
+        for (i, &n) in ns.iter().enumerate() {
+            if i > 0 {
+                tmp[len] = b'/';
+                len += 1;
+            }
+            let d = fmt_uint(&mut digits, u64::from(n));
+            tmp[len..len + d.len()].copy_from_slice(d);
+            len += d.len();
+        }
+        self.padded(&tmp[..len], width);
+    }
+
+    fn padded_sig(&mut self, x: f64, width: usize) {
+        let mut tmp = [0u8; 24];
+        let len = fmt_sig(&mut tmp, x, 4);
+        self.padded(&tmp[..len], width);
     }
 }
 
@@ -522,57 +690,86 @@ fn round_significant(x: f64, sig: usize) -> SigDigits {
 }
 
 /// Format `x` to `sig` significant digits PLINK-style (fixed-point for decimal
-/// exponents in -4..sig, scientific otherwise; trailing zeros trimmed).
-fn fmt_sig_into(out: &mut Vec<u8>, x: f64, sig: usize) {
+/// exponents in -4..sig, scientific otherwise; trailing zeros trimmed) into the
+/// start of `out`, returning the number of bytes written. `out` must hold a
+/// fully formatted value (24 bytes is ample for 4 significant digits).
+fn fmt_sig(out: &mut [u8], x: f64, sig: usize) -> usize {
+    let mut w = Cur { buf: out, pos: 0 };
     if !x.is_finite() {
-        out.extend_from_slice(b"NA");
-        return;
+        w.put_slice(b"NA");
+        return w.pos;
     }
     if x == 0.0 {
-        out.push(b'0');
-        return;
+        w.put(b'0');
+        return w.pos;
     }
     let SigDigits { digits, len, exp } = round_significant(x, sig);
 
     if exp < -4 || exp >= sig as i32 {
-        out.push(digits[0]);
+        w.put(digits[0]);
         let frac_end = (1..len).rfind(|&i| digits[i] != b'0').map_or(0, |i| i + 1);
         if frac_end > 1 {
-            out.push(b'.');
-            out.extend_from_slice(&digits[1..frac_end]);
+            w.put(b'.');
+            w.put_slice(&digits[1..frac_end]);
         }
-        out.push(b'e');
-        out.push(if exp < 0 { b'-' } else { b'+' });
+        w.put(b'e');
+        w.put(if exp < 0 { b'-' } else { b'+' });
         let e = exp.unsigned_abs();
         if e < 10 {
-            out.push(b'0');
+            w.put(b'0');
         }
-        push_uint(out, u64::from(e));
-        return;
+        let mut tmp = [0u8; 20];
+        w.put_slice(fmt_uint(&mut tmp, u64::from(e)));
+        return w.pos;
     }
 
     let point = exp + 1;
     if point <= 0 {
-        out.extend_from_slice(b"0.");
-        out.extend(std::iter::repeat_n(b'0', (-point) as usize));
+        w.put_slice(b"0.");
+        w.put_zeros((-point) as usize);
         let frac_end = (0..len).rfind(|&i| digits[i] != b'0').map_or(0, |i| i + 1);
-        out.extend_from_slice(&digits[..frac_end]);
+        w.put_slice(&digits[..frac_end]);
     } else if point as usize >= len {
-        out.extend_from_slice(&digits[..len]);
-        out.extend(std::iter::repeat_n(b'0', point as usize - len));
+        w.put_slice(&digits[..len]);
+        w.put_zeros(point as usize - len);
     } else {
         let p = point as usize;
-        out.extend_from_slice(&digits[..p]);
+        w.put_slice(&digits[..p]);
         let frac_end = (p..len).rfind(|&i| digits[i] != b'0').map_or(p, |i| i + 1);
         if frac_end > p {
-            out.push(b'.');
-            out.extend_from_slice(&digits[p..frac_end]);
+            w.put(b'.');
+            w.put_slice(&digits[p..frac_end]);
         }
+    }
+    w.pos
+}
+
+/// A bare append cursor over a byte slice for the decimal formatter.
+struct Cur<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl Cur<'_> {
+    #[inline]
+    fn put(&mut self, b: u8) {
+        self.buf[self.pos] = b;
+        self.pos += 1;
+    }
+    #[inline]
+    fn put_slice(&mut self, s: &[u8]) {
+        self.buf[self.pos..self.pos + s.len()].copy_from_slice(s);
+        self.pos += s.len();
+    }
+    #[inline]
+    fn put_zeros(&mut self, n: usize) {
+        self.buf[self.pos..self.pos + n].fill(b'0');
+        self.pos += n;
     }
 }
 
-fn push_uint(out: &mut Vec<u8>, mut n: u64) {
-    let mut buf = [0u8; 20];
+/// Decimal-format `n` into the back of `buf`, returning the live digit slice.
+fn fmt_uint(buf: &mut [u8; 20], mut n: u64) -> &[u8] {
     let mut i = buf.len();
     loop {
         i -= 1;
@@ -582,7 +779,7 @@ fn push_uint(out: &mut Vec<u8>, mut n: u64) {
             break;
         }
     }
-    out.extend_from_slice(&buf[i..]);
+    &buf[i..]
 }
 
 #[cfg(test)]
@@ -594,9 +791,58 @@ mod tests {
     }
 
     fn fmt_g(x: f64) -> String {
-        let mut s = Vec::new();
-        fmt_sig_into(&mut s, x, 4);
-        String::from_utf8(s).unwrap()
+        let mut s = [0u8; 24];
+        let len = fmt_sig(&mut s, x, 4);
+        String::from_utf8(s[..len].to_vec()).unwrap()
+    }
+
+    /// Reference genotype count: one lane at a time, no carry-save tree.
+    fn count_naive(row: &[u8], masks: &GroupMasks) -> (GenoCounts, GenoCounts) {
+        let mut t = [0u32; 6];
+        for (w, chunk) in row.chunks(8).enumerate() {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            let s = class_streams(u64::from_le_bytes(buf), masks.case[w], masks.ctrl[w]);
+            for k in 0..6 {
+                t[k] += s[k].count_ones();
+            }
+        }
+        let g = |i| GenoCounts {
+            hom_a1: t[i],
+            het: t[i + 1],
+            hom_a2: t[i + 2],
+        };
+        (g(0), g(3))
+    }
+
+    #[test]
+    fn count_row_matches_naive_across_word_counts() {
+        // The golden fixture's rows are a handful of words; sweep odd sizes that
+        // hit the zero-padded tail and many-word cases against an independent
+        // chunk-at-a-time reference.
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for n_samples in [1usize, 31, 32, 33, 256, 257, 1000, 8000, 8003] {
+            let pheno: Vec<Pheno> = (0..n_samples)
+                .map(|i| match i % 3 {
+                    0 => Pheno::Aff,
+                    1 => Pheno::Unaff,
+                    _ => Pheno::Skip,
+                })
+                .collect();
+            let masks = GroupMasks::build(&pheno);
+            let row: Vec<u8> = (0..n_samples.div_ceil(4)).map(|_| rng() as u8).collect();
+            assert_eq!(
+                count_row(&row, &masks),
+                count_naive(&row, &masks),
+                "mismatch at n_samples={n_samples}"
+            );
+        }
     }
 
     #[test]

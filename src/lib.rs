@@ -10,5 +10,5 @@
 pub mod model;
 pub mod stats;
 
-pub use model::{DEFAULT_CELL, VariantTests, model_test, print_model};
+pub use model::{BedRows, DEFAULT_CELL, VariantTests, model_test, print_model, write_model};
 pub use stats::chi2_sf;

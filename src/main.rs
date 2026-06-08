@@ -1,6 +1,6 @@
 use clap::Parser;
-use rsomics_pgen::Pgen;
-use rsomics_plink_model::{DEFAULT_CELL, model_test, print_model};
+use rsomics_pgen::PgenMmap;
+use rsomics_plink_model::{DEFAULT_CELL, write_model};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -31,11 +31,13 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
-    let pgen = Pgen::load(&cli.bfile)?;
-    let records = model_test(&pgen, cli.cell);
+    let pgen = PgenMmap::open(&cli.bfile)?;
+    // `write_model` batches each variant block into multi-megabyte writes; a
+    // 1 MiB BufWriter lets those pass straight through instead of the default
+    // 8 KiB handle re-chopping them into thousands of syscalls.
     let stdout = std::io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
-    print_model(&records, &mut out)?;
+    let mut out = BufWriter::with_capacity(1 << 20, stdout.lock());
+    write_model(&pgen, cli.cell, &mut out)?;
     out.flush()?;
     Ok(())
 }
